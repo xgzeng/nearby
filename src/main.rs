@@ -1,11 +1,13 @@
 use bluer::{
     AdapterEvent, Address, DeviceEvent, DeviceProperty, DiscoveryFilter, DiscoveryTransport,
 };
+use clap::Parser;
 use commands::run;
 use config::get_config;
 use futures::{pin_mut, stream::SelectAll, StreamExt};
 use std::{
     collections::HashSet,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -14,9 +16,23 @@ mod commands;
 mod config;
 mod idle;
 
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// Sets a custom config file
+    #[arg(short, long, value_name = "CONFIG_FILE")]
+    config: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = Arc::new(Mutex::new(get_config()?));
+    let cli = Cli::parse();
+    let config = Arc::new(Mutex::new(get_config(cli.config.as_deref())?));
+    if config.lock().unwrap().is_empty() {
+        println!("No connections configured. Exiting.");
+        return Ok(());
+    }
+
     let ble_addresses: HashSet<_> = config
         .lock()
         .unwrap()

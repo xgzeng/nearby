@@ -4,28 +4,29 @@ use figment::{
     Figment,
 };
 use serde::Deserialize;
+use std::path::Path;
 
 #[derive(Deserialize, Debug)]
 pub struct Config {
-    pub connection: Option<Vec<Connection>>,
+    #[serde(default)]
+    pub connection: Vec<Connection>,
 }
 
 impl Config {
     pub fn connections(&self) -> Vec<&Connection> {
-        self.connection
-            .as_ref()
-            .map(|connections| connections.iter().collect())
-            .unwrap_or_default()
+        self.connection.iter().collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.connection.is_empty()
     }
 
     pub fn update_rssi(&mut self, mac: &str, rssi: i16) {
-        if let Some(connections) = &mut self.connection {
-            for connection in connections.iter_mut() {
-                match connection {
-                    Connection::Ble(ble) => {
-                        if ble.mac == mac {
-                            ble.rssi = Some(rssi);
-                        }
+        for connection in self.connection.iter_mut() {
+            match connection {
+                Connection::Ble(ble) => {
+                    if ble.mac == mac {
+                        ble.rssi = Some(rssi);
                     }
                 }
             }
@@ -139,11 +140,19 @@ pub struct ProximityAction {
 }
 
 const APP_NAME: &str = "nearby";
-pub fn get_config() -> anyhow::Result<Config> {
+
+pub fn default_config_dir() -> std::path::PathBuf {
     let config_dir = dirs::config_dir().expect("Could not find config directory");
-    let base_dir = config_dir.join(APP_NAME);
-    std::fs::create_dir_all(&base_dir)?;
-    let config_file = base_dir.join("config.toml");
+    config_dir.join(APP_NAME)
+}
+
+pub fn get_config(cfg_file: Option<&Path>) -> anyhow::Result<Config> {
+    let config_file = if let Some(cfg_file) = cfg_file {
+        cfg_file.to_path_buf()
+    } else {
+        default_config_dir().join("config.toml")
+    };
+
     let config: Config = Figment::new()
         .merge(Toml::file(config_file))
         .merge(Env::prefixed(&format!("{APP_NAME}_")))
