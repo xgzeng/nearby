@@ -1,7 +1,7 @@
 use bluer::{
     AdapterEvent, DeviceEvent, DeviceProperty, DiscoveryFilter, DiscoveryTransport,
 };
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use commands::run;
 use config::get_config;
 use futures::{pin_mut, stream::SelectAll, StreamExt};
@@ -11,25 +11,75 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{spawn, time::sleep};
+
 mod commands;
 mod config;
 mod idle;
+mod setup;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Sets a custom config file
-    #[arg(short, long, value_name = "CONFIG_FILE")]
-    config: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run the proximity daemon (default)
+    Run {
+        /// Sets a custom config file
+        #[arg(short, long, value_name = "CONFIG_FILE")]
+        config: Option<PathBuf>,
+    },
+    /// Run the interactive setup wizard
+    Setup,
+}
+
+async fn check_bluetooth_permissions() -> anyhow::Result<()> {
+    match bluer::Session::new().await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if e.kind == bluer::ErrorKind::NotAuthorized {
+                anyhow::bail!(
+                    "Bluetooth access denied. Please ensure your user is in the 'bluetooth' group.\n\
+                    You can add your user with: sudo usermod -aG bluetooth $USER\n\
+                    Note: You may need to log out and back in for changes to take effect."
+                );
+            }
+            Err(e.into())
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    
+    // Check permissions before doing anything else
+    check_bluetooth_permissions().await?;
+
     let cli = Cli::parse();
-    let config = Arc::new(get_config(cli.config.as_deref())?);
+    
+    match cli.command {
+        Some(Commands::Setup) => {
+            setup::run_wizard()?;
+        }
+        Some(Commands::Run { config }) => {
+            run_daemon(config).await?;
+        }
+        None => {
+            run_daemon(None).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let config = Arc::new(get_config(config_path.as_deref())?);
     if config.is_empty() {
-        log::error!("No connections configured. Exiting.");
+        log::error!("No connections configured. Run 'nearby setup' or provide a config file.");
         return Ok(());
     }
 
@@ -96,10 +146,8 @@ async fn main() -> anyhow::Result<()> {
                         let rssi = device.rssi().await?.unwrap_or_default();
 
                         config.update_rssi(&addr.to_string(), rssi);
-                        log::info!("{:?} {:.2}",addr,distance_rssi(rssi));
+                        log::info!("{:?} {:.2}m",addr,distance_rssi(rssi));
 
-                        // with changes
-                        // let device = adapter.device(addr)?;
                         let change_events = device.events().await?.map(move |evt| (addr, evt));
                         all_change_events.push(change_events);
                     }
