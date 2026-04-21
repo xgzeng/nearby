@@ -4,9 +4,15 @@ use figment::{
     Figment,
 };
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 
 use std::sync::Mutex;
+
+pub fn save_config(path: &Path, data: &ConfigData) -> anyhow::Result<()> {
+    todo!("Implement secure save")
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ConfigData {
@@ -187,4 +193,48 @@ pub fn get_config(cfg_file: Option<&Path>) -> anyhow::Result<Config> {
         .extract()?;
 
     Ok(Config::new(data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_save_config_permissions_and_content() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let config_path = dir.path().join("nearby").join("config.toml");
+        
+        let data = ConfigData {
+            connection: vec![Connection::Ble(BLEConnection {
+                mac: "AA:BB:CC:DD:EE:FF".to_string(),
+                rssi: None,
+                actions: Some(vec![Action::Nearby(ProximityAction {
+                    threshold: 2.0,
+                    command: Command::Unlock,
+                })]),
+            })],
+        };
+
+        save_config(&config_path, &data)?;
+
+        // Check directory permissions
+        let parent = config_path.parent().unwrap();
+        let parent_metadata = fs::metadata(parent)?;
+        assert_eq!(parent_metadata.mode() & 0o777, 0o700);
+
+        // Check file permissions
+        let file_metadata = fs::metadata(&config_path)?;
+        assert_eq!(file_metadata.mode() & 0o777, 0o600);
+
+        // Check content (round-trip)
+        let content = fs::read_to_string(&config_path)?;
+        let loaded: ConfigData = toml::from_str(&content)?;
+        assert_eq!(loaded.connection.len(), 1);
+        let Connection::Ble(ble) = &loaded.connection[0];
+        assert_eq!(ble.mac, "AA:BB:CC:DD:EE:FF");
+
+        Ok(())
+    }
 }
