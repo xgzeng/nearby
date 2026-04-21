@@ -11,7 +11,26 @@ use std::path::Path;
 use std::sync::Mutex;
 
 pub fn save_config(path: &Path, data: &ConfigData) -> anyhow::Result<()> {
-    todo!("Implement secure save")
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+    }
+
+    let toml_string = toml::to_string_pretty(data)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+
+    use std::io::Write;
+    file.write_all(toml_string.as_bytes())?;
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
