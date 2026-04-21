@@ -26,10 +26,11 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
     let config = Arc::new(Mutex::new(get_config(cli.config.as_deref())?));
     if config.lock().unwrap().is_empty() {
-        println!("No connections configured. Exiting.");
+        log::error!("No connections configured. Exiting.");
         return Ok(());
     }
 
@@ -42,8 +43,8 @@ async fn main() -> anyhow::Result<()> {
         .map(|c| c.mac.parse::<Address>().unwrap())
         .collect();
 
-    env_logger::init();
     let session = bluer::Session::new().await?;
+
     let adapter = session.default_adapter().await?;
     adapter.set_powered(true).await?;
 
@@ -65,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
 
             let can_unlock = cfg.lock().unwrap().can_unlock();
             if can_unlock {
-                println!("Unlocking...");
+                log::info!("Unlocking...");
                 run("sudo loginctl unlock-sessions").unwrap();
                 continue;
             }
@@ -85,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
             let idle_for = SystemTime::now().duration_since(idle_since).unwrap();
 
             if idle && idle_for > Duration::from_secs(10) {
-                println!("Idle for: {:?}", idle_for);
+                log::info!("Idle for: {:?}", idle_for);
                 run("sudo loginctl lock-sessions").unwrap();
             }
         }
@@ -96,22 +97,29 @@ async fn main() -> anyhow::Result<()> {
             Some(device_event) = device_events.next() => {
                 match device_event {
                     AdapterEvent::DeviceAdded(addr) => {
-                        if !ble_addresses.is_empty() && !ble_addresses.contains(&addr) {
+                        log::debug!("{} Added", addr);
+
+                        if !ble_addresses.contains(&addr) {
                             continue;
                         }
                         let device = adapter.device(addr)?;
                         let rssi = device.rssi().await?.unwrap_or_default();
 
                         config.lock().unwrap().update_rssi(&addr.to_string(), rssi);
-                        println!("{:?} {:.2}",addr,distance_rssi(rssi));
+                        log::info!("{:?} {:.2}",addr,distance_rssi(rssi));
 
                         // with changes
-                        let device = adapter.device(addr)?;
+                        // let device = adapter.device(addr)?;
                         let change_events = device.events().await?.map(move |evt| (addr, evt));
                         all_change_events.push(change_events);
                     }
                     AdapterEvent::DeviceRemoved(addr) => {
-                        println!("{addr} Removed");
+                        log::debug!("{} Removed", addr);
+
+                        if !ble_addresses.contains(&addr) {
+                            continue;
+                        }
+
                         config.lock().unwrap().update_rssi(&addr.to_string(), -99);
                     }
                     _ => (),
@@ -121,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
                 match property {
                     DeviceProperty::Rssi(rssi) => {
                         config.lock().unwrap().update_rssi(&addr.to_string(), rssi);
-                        println!("{:?} {:.2}m", addr, distance_rssi(rssi));
+                        log::info!("{:?} {:.2}m", addr, distance_rssi(rssi));
                     },
                     _ => {
                         // println!("    {property:?}");
