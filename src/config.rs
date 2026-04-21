@@ -3,12 +3,12 @@ use figment::{
     providers::{Env, Format, Toml},
     Figment,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use std::sync::Mutex;
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ConfigData {
     #[serde(default)]
     pub connection: Vec<Connection>,
@@ -83,7 +83,7 @@ impl Config {
     }
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 #[serde(rename_all = "lowercase")]
 pub enum Connection {
@@ -98,7 +98,7 @@ impl Connection {
     }
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BLEConnection {
     pub mac: String,
     pub rssi: Option<i16>,
@@ -152,7 +152,7 @@ impl BLEConnection {
     }
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
@@ -160,7 +160,7 @@ pub enum Action {
     Away(ProximityAction),
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProximityAction {
     #[serde(default)]
     pub threshold: f32,
