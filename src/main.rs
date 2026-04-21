@@ -1,14 +1,13 @@
 use bluer::{
-    AdapterEvent, Address, DeviceEvent, DeviceProperty, DiscoveryFilter, DiscoveryTransport,
+    AdapterEvent, DeviceEvent, DeviceProperty, DiscoveryFilter, DiscoveryTransport,
 };
 use clap::Parser;
 use commands::run;
 use config::get_config;
 use futures::{pin_mut, stream::SelectAll, StreamExt};
 use std::{
-    collections::HashSet,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{spawn, time::sleep};
@@ -28,20 +27,11 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
-    let config = Arc::new(Mutex::new(get_config(cli.config.as_deref())?));
-    if config.lock().unwrap().is_empty() {
+    let config = Arc::new(get_config(cli.config.as_deref())?);
+    if config.is_empty() {
         log::error!("No connections configured. Exiting.");
         return Ok(());
     }
-
-    let ble_addresses: HashSet<_> = config
-        .lock()
-        .unwrap()
-        .connections()
-        .iter()
-        .filter_map(|c| c.get_ble())
-        .map(|c| c.mac.parse::<Address>().unwrap())
-        .collect();
 
     let session = bluer::Session::new().await?;
 
@@ -64,19 +54,19 @@ async fn main() -> anyhow::Result<()> {
         loop {
             sleep(std::time::Duration::from_secs(1)).await;
 
-            let can_unlock = cfg.lock().unwrap().can_unlock();
+            let can_unlock = cfg.can_unlock();
             if can_unlock {
                 log::info!("Unlocking...");
                 run("sudo loginctl unlock-sessions").unwrap();
                 continue;
             }
 
-            let should_lock = cfg.lock().unwrap().should_lock();
+            let should_lock = cfg.should_lock();
             if !should_lock {
                 continue;
             }
 
-            let keep_unlocked = cfg.lock().unwrap().keep_unlocked();
+            let keep_unlocked = cfg.keep_unlocked();
             if keep_unlocked {
                 continue;
             }
@@ -99,13 +89,13 @@ async fn main() -> anyhow::Result<()> {
                     AdapterEvent::DeviceAdded(addr) => {
                         log::debug!("{} Added", addr);
 
-                        if !ble_addresses.contains(&addr) {
+                        if !config.contains(&addr.to_string()) {
                             continue;
                         }
                         let device = adapter.device(addr)?;
                         let rssi = device.rssi().await?.unwrap_or_default();
 
-                        config.lock().unwrap().update_rssi(&addr.to_string(), rssi);
+                        config.update_rssi(&addr.to_string(), rssi);
                         log::info!("{:?} {:.2}",addr,distance_rssi(rssi));
 
                         // with changes
@@ -116,11 +106,11 @@ async fn main() -> anyhow::Result<()> {
                     AdapterEvent::DeviceRemoved(addr) => {
                         log::debug!("{} Removed", addr);
 
-                        if !ble_addresses.contains(&addr) {
+                        if !config.contains(&addr.to_string()) {
                             continue;
                         }
 
-                        config.lock().unwrap().update_rssi(&addr.to_string(), -99);
+                        config.update_rssi(&addr.to_string(), -99);
                     }
                     _ => (),
                 }
@@ -128,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
             Some((addr, DeviceEvent::PropertyChanged(property))) = all_change_events.next() => {
                 match property {
                     DeviceProperty::Rssi(rssi) => {
-                        config.lock().unwrap().update_rssi(&addr.to_string(), rssi);
+                        config.update_rssi(&addr.to_string(), rssi);
                         log::info!("{:?} {:.2}m", addr, distance_rssi(rssi));
                     },
                     _ => {

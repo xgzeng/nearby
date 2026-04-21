@@ -6,23 +6,45 @@ use figment::{
 use serde::Deserialize;
 use std::path::Path;
 
+use std::sync::Mutex;
+
 #[derive(Deserialize, Debug)]
-pub struct Config {
+pub struct ConfigData {
     #[serde(default)]
     pub connection: Vec<Connection>,
 }
 
+#[derive(Debug)]
+pub struct Config {
+    inner: Mutex<ConfigData>,
+}
+
 impl Config {
-    pub fn connections(&self) -> Vec<&Connection> {
-        self.connection.iter().collect()
+    pub fn new(data: ConfigData) -> Self {
+        Self {
+            inner: Mutex::new(data),
+        }
+    }
+
+    pub fn connections(&self) -> Vec<Connection> {
+        self.inner.lock().unwrap().connection.clone()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.connection.is_empty()
+        self.inner.lock().unwrap().connection.is_empty()
     }
 
-    pub fn update_rssi(&mut self, mac: &str, rssi: i16) {
-        for connection in self.connection.iter_mut() {
+    pub fn contains(&self, mac: &str) -> bool {
+        self.inner.lock().unwrap().connection.iter().any(|c| {
+            c.get_ble()
+                .map(|ble| ble.mac == mac)
+                .unwrap_or(false)
+        })
+    }
+
+    pub fn update_rssi(&self, mac: &str, rssi: i16) {
+        let mut inner = self.inner.lock().unwrap();
+        for connection in inner.connection.iter_mut() {
             match connection {
                 Connection::Ble(ble) => {
                     if ble.mac == mac {
@@ -34,28 +56,34 @@ impl Config {
     }
 
     pub fn should_lock(&self) -> bool {
-        self.connections()
+        let inner = self.inner.lock().unwrap();
+        inner
+            .connection
             .iter()
             .filter_map(|c| c.get_ble())
             .any(|ble| ble.should_lock())
     }
 
     pub fn can_unlock(&self) -> bool {
-        self.connections()
+        let inner = self.inner.lock().unwrap();
+        inner
+            .connection
             .iter()
             .filter_map(|c| c.get_ble())
             .any(|ble| ble.can_unlock())
     }
 
     pub fn keep_unlocked(&self) -> bool {
-        self.connections()
+        let inner = self.inner.lock().unwrap();
+        inner
+            .connection
             .iter()
             .filter_map(|c| c.get_ble())
             .any(|ble| ble.keep_unlocked())
     }
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 #[serde(rename_all = "lowercase")]
 pub enum Connection {
@@ -70,7 +98,7 @@ impl Connection {
     }
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct BLEConnection {
     pub mac: String,
     pub rssi: Option<i16>,
@@ -153,10 +181,10 @@ pub fn get_config(cfg_file: Option<&Path>) -> anyhow::Result<Config> {
         default_config_dir().join("config.toml")
     };
 
-    let config: Config = Figment::new()
+    let data: ConfigData = Figment::new()
         .merge(Toml::file(config_file))
         .merge(Env::prefixed(&format!("{APP_NAME}_")))
         .extract()?;
 
-    Ok(config)
+    Ok(Config::new(data))
 }
