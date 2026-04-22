@@ -1,6 +1,4 @@
-use bluer::{
-    AdapterEvent, DeviceEvent, DeviceProperty, DiscoveryFilter, DiscoveryTransport,
-};
+use bluer::{AdapterEvent, DeviceEvent, DeviceProperty, DiscoveryFilter, DiscoveryTransport};
 use clap::{Parser, Subcommand};
 use commands::run;
 use config::get_config;
@@ -20,18 +18,16 @@ mod setup;
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
+    /// Sets a custom config file
+    #[arg(short, long, value_name = "CONFIG_FILE")]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the proximity daemon (default)
-    Run {
-        /// Sets a custom config file
-        #[arg(short, long, value_name = "CONFIG_FILE")]
-        config: Option<PathBuf>,
-    },
     /// Run the interactive setup wizard
     Setup,
 }
@@ -55,21 +51,17 @@ async fn check_bluetooth_permissions() -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    
-    // Check permissions before doing anything else
-    check_bluetooth_permissions().await?;
 
     let cli = Cli::parse();
-    
+
     match cli.command {
         Some(Commands::Setup) => {
-            setup::run_wizard()?;
-        }
-        Some(Commands::Run { config }) => {
-            run_daemon(config).await?;
+            check_bluetooth_permissions().await?;
+            setup::run_wizard(cli.config).await?;
         }
         None => {
-            run_daemon(None).await?;
+            check_bluetooth_permissions().await?;
+            run_daemon(cli.config).await?;
         }
     }
 
@@ -77,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    log::info!("Starting daemon...");
     let config = Arc::new(get_config(config_path.as_deref())?);
     if config.is_empty() {
         log::error!("No connections configured. Run 'nearby setup' or provide a config file.");
@@ -84,7 +77,6 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     }
 
     let session = bluer::Session::new().await?;
-
     let adapter = session.default_adapter().await?;
     adapter.set_powered(true).await?;
 
@@ -107,7 +99,7 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             let can_unlock = cfg.can_unlock();
             if can_unlock {
                 log::info!("Unlocking...");
-                run("sudo loginctl unlock-sessions").unwrap();
+                run("loginctl unlock-sessions").unwrap();
                 continue;
             }
 
@@ -127,7 +119,7 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
 
             if idle && idle_for > Duration::from_secs(10) {
                 log::info!("Idle for: {:?}", idle_for);
-                run("sudo loginctl lock-sessions").unwrap();
+                run("loginctl lock-sessions").unwrap();
             }
         }
     });
@@ -169,16 +161,11 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                         config.update_rssi(&addr.to_string(), rssi);
                         log::info!("{:?} {:.2}m", addr, distance_rssi(rssi));
                     },
-                    _ => {
-                        // println!("    {property:?}");
-                    }
+                    _ => {}
                 }
             }
-            else => break
         }
     }
-
-    Ok(())
 }
 
 pub fn distance_rssi(rssi: i16) -> f32 {

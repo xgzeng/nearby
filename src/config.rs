@@ -10,6 +10,15 @@ use std::path::Path;
 
 use std::sync::Mutex;
 
+pub fn backup_config(path: &Path) -> anyhow::Result<()> {
+    if path.exists() {
+        let mut backup_path = path.to_path_buf();
+        backup_path.set_extension("toml.bak");
+        fs::copy(path, backup_path)?;
+    }
+    Ok(())
+}
+
 pub fn save_config(path: &Path, data: &ConfigData) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.exists() {
@@ -49,10 +58,6 @@ impl Config {
         Self {
             inner: Mutex::new(data),
         }
-    }
-
-    pub fn connections(&self) -> Vec<Connection> {
-        self.inner.lock().unwrap().connection.clone()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -126,6 +131,7 @@ impl Connection {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BLEConnection {
     pub mac: String,
+    pub name: Option<String>,
     pub rssi: Option<i16>,
     pub actions: Option<Vec<Action>>,
 }
@@ -228,11 +234,13 @@ mod tests {
         let data = ConfigData {
             connection: vec![Connection::Ble(BLEConnection {
                 mac: "AA:BB:CC:DD:EE:FF".to_string(),
+                name: Some("Test Device".to_string()),
                 rssi: None,
-                actions: Some(vec![Action::Nearby(ProximityAction {
-                    threshold: 2.0,
-                    command: Command::Unlock,
-                })]),
+                actions: Some(vec![
+                    Action::Nearby(ProximityAction {
+                        threshold: 2.0,
+                        command: Command::Unlock,
+                    })]),
             })],
         };
 
@@ -253,6 +261,21 @@ mod tests {
         assert_eq!(loaded.connection.len(), 1);
         let Connection::Ble(ble) = &loaded.connection[0];
         assert_eq!(ble.mac, "AA:BB:CC:DD:EE:FF");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_backup_config() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+        let backup_path = dir.path().join("config.toml.bak");
+
+        fs::write(&config_path, "test content")?;
+        backup_config(&config_path)?;
+
+        assert!(backup_path.exists());
+        assert_eq!(fs::read_to_string(backup_path)?, "test content");
 
         Ok(())
     }

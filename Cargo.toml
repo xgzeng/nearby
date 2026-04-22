@@ -14,10 +14,12 @@ futures = "0.3.32"
 log = "0.4.29"
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1.2"
-inquire = "0.9.4"
 tokio = { version = "1.52.1", features = ["full"] }
 zbus = "5.14.0"
-zbus_systemd = { version = "0.26000.0", features = ["login1"] }
+zbus_systemd = { version = "0.26000.0", features = ["login1", "systemd1", "zbus-async-tokio"] }
+crossterm = "0.29.0"
+ratatui = { version = "0.30.0", features = ["crossterm"] }
+libc = "0.2.185"
 
 [dev-dependencies]
 tempfile = "3.10"
