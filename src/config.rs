@@ -42,10 +42,11 @@ pub fn save_config(path: &Path, data: &ConfigData) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ConfigData {
     #[serde(default)]
     pub connection: Vec<Connection>,
+    pub seat: Option<String>,
 }
 
 #[derive(Debug)]
@@ -62,6 +63,10 @@ impl Config {
 
     pub fn is_empty(&self) -> bool {
         self.inner.lock().unwrap().connection.is_empty()
+    }
+
+    pub fn seat(&self) -> Option<String> {
+        self.inner.lock().unwrap().seat.clone()
     }
 
     pub fn contains(&self, mac: &str) -> bool {
@@ -255,6 +260,7 @@ mod tests {
                     command: Command::Unlock,
                 })]),
             })],
+            seat: Some("seat0".to_string()),
         };
 
         save_config(&config_path, &data)?;

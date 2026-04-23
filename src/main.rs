@@ -3,17 +3,15 @@ use bluer::{AdapterEvent, DeviceEvent, DeviceProperty, DiscoveryFilter, Discover
 use clap::{Parser, Subcommand};
 use config::get_config;
 use futures::{pin_mut, stream::SelectAll, StreamExt};
-use std::{
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{spawn, time::sleep};
 
 mod commands;
 mod config;
-mod idle;
+mod login_manager;
 mod setup;
+
+use login_manager::LoginManager;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -76,7 +74,13 @@ async fn run_daemon(config_path: Option<PathBuf>) -> Result<()> {
         return Ok(());
     }
 
-    let login_manager = idle::login_manager().await?;
+    let login_manager = if let Some(s) = config.seat() {
+        log::info!("create LoginManager for seat {}", s);
+        LoginManager::new_for_seat(&s).await?
+    } else {
+        log::info!("create LoginManager for all sessions");
+        LoginManager::new_for_all().await?
+    };
 
     let session = bluer::Session::new().await?;
     let adapter = session.default_adapter().await?;
@@ -100,8 +104,8 @@ async fn run_daemon(config_path: Option<PathBuf>) -> Result<()> {
             let can_unlock = cfg.can_unlock();
             if can_unlock {
                 log::info!("Unlocking...");
-                if let Err(e) = login_manager.unlock_sessions().await {
-                    log::error!("Failed to unlock sessions: {}", e);
+                if let Err(e) = login_manager.unlock().await {
+                    log::error!("Failed to unlock: {}", e);
                 }
                 continue;
             }
@@ -109,8 +113,8 @@ async fn run_daemon(config_path: Option<PathBuf>) -> Result<()> {
             let should_lock = cfg.should_lock();
             if should_lock {
                 log::info!("Locking...");
-                if let Err(e) = login_manager.lock_sessions().await {
-                    log::error!("Failed to lock sessions: {}", e);
+                if let Err(e) = login_manager.lock().await {
+                    log::error!("Failed to lock: {}", e);
                 }
                 continue;
             }
@@ -120,16 +124,11 @@ async fn run_daemon(config_path: Option<PathBuf>) -> Result<()> {
                 continue;
             }
 
-            if let Ok((idle, idle_since)) = idle::get_idle_hint().await {
-                let idle_since = UNIX_EPOCH + Duration::from_micros(idle_since);
-                let idle_for = SystemTime::now()
-                    .duration_since(idle_since)
-                    .unwrap_or(Duration::from_secs(0));
-
+            if let Ok((idle, idle_for)) = login_manager.get_idle_hint_info().await {
                 if idle && idle_for > Duration::from_secs(10) {
                     log::info!("Idle for: {:?}", idle_for);
-                    if let Err(e) = login_manager.lock_sessions().await {
-                        log::error!("Failed to lock sessions: {}", e);
+                    if let Err(e) = login_manager.lock().await {
+                        log::error!("Failed to lock on idle: {}", e);
                     }
                 }
             }

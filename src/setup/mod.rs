@@ -13,10 +13,10 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Clear},
     Terminal,
 };
 
@@ -28,9 +28,9 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<()> {
     let config_path = config_path.unwrap_or_else(|| default_config_dir().join("config.toml"));
     let initial_data = if config_path.exists() {
         let content = fs::read_to_string(&config_path)?;
-        toml::from_str::<ConfigData>(&content).unwrap_or(ConfigData { connection: vec![] })
+        toml::from_str::<ConfigData>(&content).unwrap_or_default()
     } else {
-        ConfigData { connection: vec![] }
+        ConfigData::default()
     };
 
     let session = bluer::Session::new().await?;
@@ -38,13 +38,13 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<()> {
     adapter.set_powered(true).await?;
 
     // 2. Multi-device Setup UI
-    let final_configs = discovery::setup_devices(&adapter, &initial_data, &config_path).await?;
+    let (final_configs, final_seat) = discovery::setup_devices(&adapter, &initial_data, &config_path).await?;
     
     if final_configs.is_empty() {
         println!("No devices configured. Configuration will be empty.");
     }
 
-    // 3. Confirmation Screen
+    // 3. Confirmation Screen (Popup)
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -52,49 +52,41 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<()> {
     let mut confirmed = None;
     while confirmed.is_none() {
         terminal.draw(|f| {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .margin(2)
-                .constraints([Constraint::Min(0), Constraint::Length(3)])
-                .split(f.area());
+            let area = f.area();
+            
+            // Background is just black or slightly dimmed
+            let background = Block::default().bg(Color::Reset);
+            f.render_widget(background, area);
 
-            let mut confirm_text = vec![
-                Line::from("Devices to be saved:".bold()),
+            let popup_area = centered_rect(60, 25, area);
+            f.render_widget(Clear, popup_area); // This clears the area for the popup
+
+            let warning_text = vec![
                 Line::from(""),
+                Line::from(Span::styled(" SECURITY WARNING ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))),
+                Line::from(""),
+                Line::from("Enabling automatic 'Unlock' can allow anyone with your device"),
+                Line::from("to access your session. This is a potential security risk."),
+                Line::from(""),
+                Line::from("Are you sure you want to save these changes?"),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("Press "),
+                    Span::styled("y", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    Span::raw(" to Save, or "),
+                    Span::styled("n", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    Span::raw(" to Abort"),
+                ]),
             ];
 
-            if final_configs.is_empty() {
-                confirm_text.push(Line::from("  None (All devices will be removed)".red()));
-            } else {
-                for (dev, n_rssi, a_rssi) in &final_configs {
-                    confirm_text.push(Line::from(vec![
-                        Span::raw("  • "),
-                        Span::styled(format!("{} ({})", dev.name.as_deref().unwrap_or("<Unknown>"), dev.addr), Style::default().fg(Color::Cyan)),
-                        Span::raw(format!(" | Nearby: {}dBm | Away: {}dBm", n_rssi, a_rssi)),
-                    ]));
-                }
-            }
-
-            confirm_text.push(Line::from(""));
-            confirm_text.push(Line::from(vec![
-                Span::styled("SECURITY WARNING: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-                Span::raw("Enabling automatic 'Unlock' can allow anyone with your device to access your session."),
-            ]));
-
-            let p = Paragraph::new(confirm_text)
-                .block(Block::default().borders(Borders::ALL).title(" Final Confirmation ").border_style(Style::default().fg(Color::Red)));
-            f.render_widget(p, chunks[0]);
-
-            let help = Line::from(vec![
-                Span::raw("Press "),
-                Span::styled("y", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                Span::raw(" to Save & Continue, or "),
-                Span::styled("n", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-                Span::raw(" to Abort"),
-            ]);
-            let help_p = Paragraph::new(help)
-                .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
-            f.render_widget(help_p, chunks[1]);
+            let p = Paragraph::new(warning_text)
+                .alignment(ratatui::layout::Alignment::Center)
+                .block(Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Confirmation ")
+                    .border_style(Style::default().fg(Color::Red)));
+            
+            f.render_widget(p, popup_area);
         })?;
 
         if event::poll(Duration::from_millis(100))? {
@@ -117,7 +109,7 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<()> {
     }
 
     // 4. Update and Save Configuration
-    let mut new_data = ConfigData { connection: vec![] };
+    let mut new_data = ConfigData { connection: vec![], seat: final_seat };
     for (dev, n_rssi, a_rssi) in final_configs {
         new_data.connection.push(Connection::Ble(BLEConnection {
             mac: dev.addr.clone(),
@@ -137,4 +129,25 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<()> {
     println!("Configuration saved successfully! Restart the nearby service to apply changes.");
     
     Ok(())
+}
+
+/// helper function to create a centered rect using up certain percentage of available rect `r`
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
 }

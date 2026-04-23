@@ -1,4 +1,7 @@
 # ~/.config/nearby/config.toml
+# Optional: only lock/unlock sessions for a specific seat
+# seat = "seat0"
+
 [[connection]]
 name = "My Watch"
 type = "ble"

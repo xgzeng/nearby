@@ -44,8 +44,8 @@ enum FilterField {
 pub async fn setup_devices(
     adapter: &Adapter,
     initial_config: &ConfigData,
-    config_path: &Path,
-) -> Result<Vec<(DiscoveredDevice, i16, i16)>> {
+    _config_path: &Path,
+) -> Result<(Vec<(DiscoveredDevice, i16, i16)>, Option<String>)> {
     let filter = DiscoveryFilter {
         transport: DiscoveryTransport::Le,
         duplicate_data: true,
@@ -65,6 +65,20 @@ pub async fn setup_devices(
     let mut mac_filter = String::new();
     let mut rssi_filter: Option<i16> = None;
     let mut active_field = FilterField::None;
+
+    // Seat state
+    let available_seats = crate::login_manager::list_seat_names().await.unwrap_or_default();
+    let mut seat_options: Vec<Option<String>> = vec![None];
+    for s in available_seats {
+        seat_options.push(Some(s));
+    }
+    
+    let mut seat_index = 0;
+    if let Some(initial_seat) = &initial_config.seat {
+        if let Some(pos) = seat_options.iter().position(|o| o.as_ref() == Some(initial_seat)) {
+            seat_index = pos;
+        }
+    }
 
     // Calibration state (mapped by address)
     let mut thresholds: HashMap<String, (Option<i16>, Option<i16>)> = HashMap::new();
@@ -98,121 +112,100 @@ pub async fn setup_devices(
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, Hide)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let result = 'main: loop {
-        // 1. Filter and Sort
         let mut devices_list: Vec<DiscoveredDevice> = devices_map
             .values()
+            .cloned()
             .filter(|d| {
                 if show_only_named && d.name.is_none() {
                     return false;
                 }
-                if !mac_filter.is_empty()
-                    && !d.addr.to_lowercase().contains(&mac_filter.to_lowercase())
-                {
+                if !mac_filter.is_empty() && !d.addr.to_lowercase().contains(&mac_filter.to_lowercase()) {
                     return false;
                 }
-                if let Some(t) = rssi_filter {
-                    if let Some(rssi) = d.rssi {
-                        if rssi < t {
-                            return false;
-                        }
-                    } else {
+                if let Some(min_rssi) = rssi_filter {
+                    if d.rssi.map_or(true, |r| r < min_rssi) {
                         return false;
                     }
                 }
                 true
             })
-            .cloned()
             .collect();
-        devices_list.sort_by(|a, b| b.rssi.cmp(&a.rssi));
 
-        if let Some(selected) = table_state.selected() {
-            if selected >= devices_list.len() && !devices_list.is_empty() {
-                table_state.select(Some(devices_list.len() - 1));
+        // Sort: Configured devices first, then by RSSI
+        devices_list.sort_by(|a, b| {
+            let a_cfg = thresholds.contains_key(&a.addr);
+            let b_cfg = thresholds.contains_key(&b.addr);
+            if a_cfg != b_cfg {
+                return b_cfg.cmp(&a_cfg);
             }
-        } else if !devices_list.is_empty() {
-            table_state.select(Some(0));
-        }
+            b.rssi.cmp(&a.rssi)
+        });
 
-        let highlighted_device = table_state.selected().and_then(|i| devices_list.get(i));
+        let highlighted_device = table_state.selected().and_then(|i| devices_list.get(i).cloned());
 
-        // 2. Render
         terminal.draw(|f| {
             let main_chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .margin(1)
                 .constraints([
-                    Constraint::Length(3), // Title
+                    Constraint::Length(3), // Header
+                    Constraint::Length(3), // Seat
                     Constraint::Length(3), // Filters
                     Constraint::Min(0),    // Table
                     Constraint::Length(4), // Help
                 ])
                 .split(f.area());
 
-            // Title
-            let title_text = format!(" Nearby BLE Setup (Config: {}) ", config_path.display());
+            // Header
+            let title_text = format!(" Nearby BLE Setup Wizard (Adapter: {}) ", adapter.name());
             f.render_widget(
                 Paragraph::new(title_text.bold().cyan()).block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan)),
+                        .border_style(Style::default().fg(Color::DarkGray)),
                 ),
                 main_chunks[0],
             );
 
-            // Filters
-            let named_color = if show_only_named {
-                Color::Green
-            } else {
-                Color::DarkGray
-            };
-            let mac_color = if active_field == FilterField::Mac {
-                Color::Yellow
-            } else {
-                Color::Gray
-            };
-            let rssi_color = if active_field == FilterField::Rssi {
-                Color::Yellow
-            } else {
-                Color::Gray
-            };
+            // Seat Config
+            let seat_display = seat_options[seat_index].as_deref().unwrap_or("<all seats>");
+            let seat_line = Line::from(vec![
+                Span::raw("Managing Seat: "),
+                Span::styled(seat_display, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw(" (Press [s] to cycle through available seats)"),
+            ]);
+            f.render_widget(
+                Paragraph::new(seat_line)
+                    .block(Block::default().borders(Borders::ALL).title(" Session Configuration ")),
+                main_chunks[1],
+            );
 
-            let rssi_val_str = rssi_filter
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "None".to_string());
+            // Filters
+            let rssi_val_str = rssi_filter.map(|v| v.to_string()).unwrap_or_else(|| "All".into());
+            let mac_color = if active_field == FilterField::Mac { Color::Yellow } else { Color::DarkGray };
+            let rssi_color = if active_field == FilterField::Rssi { Color::Yellow } else { Color::DarkGray };
+
             let filter_line = Line::from(vec![
-                Span::raw(" [f] Named Only: "),
+                Span::raw("[f] Named Only: "),
+                Span::styled(if show_only_named { "ON " } else { "OFF" }, Style::default().fg(if show_only_named { Color::Green } else { Color::DarkGray })),
+                Span::raw(" | [m] MAC Filter: "),
                 Span::styled(
-                    if show_only_named { "ON " } else { "OFF" },
-                    Style::default().fg(named_color),
-                ),
-                Span::raw(" | [m] MAC: "),
-                Span::styled(
-                    if active_field == FilterField::Mac {
-                        format!("{}█", mac_filter)
-                    } else {
-                        mac_filter.clone()
-                    },
+                    if active_field == FilterField::Mac { format!("{}█", mac_filter) } else { if mac_filter.is_empty() { "None".to_string() } else { mac_filter.clone() } },
                     Style::default().fg(mac_color),
                 ),
                 Span::raw(" | [r] RSSI Min: "),
                 Span::styled(
-                    if active_field == FilterField::Rssi {
-                        format!("{}█", rssi_val_str)
-                    } else {
-                        rssi_val_str
-                    },
+                    if active_field == FilterField::Rssi { format!("{}█", rssi_val_str) } else { rssi_val_str },
                     Style::default().fg(rssi_color),
                 ),
                 Span::raw(" | [c] Clear Filters"),
             ]);
             f.render_widget(
                 Paragraph::new(filter_line)
-                    .block(Block::default().borders(Borders::ALL).title(" Filters ")),
-                main_chunks[1],
+                    .block(Block::default().borders(Borders::ALL).title(" BLE Device Filters ")),
+                main_chunks[2],
             );
 
             // Table
@@ -290,7 +283,7 @@ pub async fn setup_devices(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Discovered & Configured Devices "),
+                    .title(" BLE Devices "),
             )
             .row_highlight_style(
                 Style::default()
@@ -299,12 +292,12 @@ pub async fn setup_devices(
             )
             .highlight_symbol(">");
 
-            f.render_stateful_widget(table, main_chunks[2], &mut table_state);
+            f.render_stateful_widget(table, main_chunks[3], &mut table_state);
 
             // Help
             let help_text = vec![
                 Line::from(
-                    "↑/↓: Navigate | f/m/r: Filters | c: Clear Filters | Space: Toggle Config",
+                    "↑/↓: Navigate | s: Cycle Seat | f/m/r: Filters | c: Clear Filters | Enter: Toggle Device",
                 ),
                 Line::from(vec![
                     Span::styled(
@@ -320,12 +313,17 @@ pub async fn setup_devices(
                     ),
                     Span::raw(": Set Away | "),
                     Span::styled(
-                        "Enter",
+                        "w",
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw(": Save All & Finish"),
+                    Span::raw(": Save All & Finish | "),
+                    Span::styled(
+                        "q",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(": Quit without Save"),
                 ]),
             ];
             f.render_widget(
@@ -335,7 +333,7 @@ pub async fn setup_devices(
                         .title(" Help ")
                         .border_style(Style::default().fg(Color::DarkGray)),
                 ),
-                main_chunks[3],
+                main_chunks[4],
             );
         })?;
 
@@ -380,7 +378,10 @@ pub async fn setup_devices(
                             KeyCode::Char('f') => show_only_named = !show_only_named,
                             KeyCode::Char('m') => active_field = FilterField::Mac,
                             KeyCode::Char('r') => { active_field = FilterField::Rssi; if rssi_filter.is_none() { rssi_filter = Some(-100); } },
-                            KeyCode::Char('c') => { show_only_named = false; mac_filter.clear(); rssi_filter = None; }
+                            KeyCode::Char('s') => {
+                                seat_index = (seat_index + 1) % seat_options.len();
+                            }
+                            KeyCode::Char('c') => { show_only_named = false; mac_filter.clear(); rssi_filter = None; seat_index = 0; }
                             KeyCode::Char('n') => {
                                 if let Some(d) = highlighted_device {
                                     if let Some(rssi) = d.rssi { // Only set if online
@@ -397,7 +398,7 @@ pub async fn setup_devices(
                                     }
                                 }
                             }
-                            KeyCode::Char(' ') => {
+                            KeyCode::Enter => {
                                 if let Some(d) = highlighted_device {
                                     if thresholds.contains_key(&d.addr) {
                                         thresholds.remove(&d.addr);
@@ -411,7 +412,7 @@ pub async fn setup_devices(
                                     thresholds.remove(&d.addr);
                                 }
                             }
-                            KeyCode::Enter => {
+                            KeyCode::Char('w') => {
                                 // Finalize: collect all devices that have both thresholds set
                                 let mut final_list = Vec::new();
                                 for (addr, (n, a)) in &thresholds {
@@ -422,7 +423,8 @@ pub async fn setup_devices(
                                         }
                                     }
                                 }
-                                break 'main Ok(final_list);
+                                let final_seat = seat_options[seat_index].clone();
+                                break 'main Ok((final_list, final_seat));
                             }
                             KeyCode::Char('q') | KeyCode::Esc => break 'main Err(anyhow::anyhow!("Setup cancelled.")),
                             _ => {}
