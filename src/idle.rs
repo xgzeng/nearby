@@ -7,7 +7,7 @@ pub async fn get_idle_hint() -> zbus::Result<(bool, u64)> {
     Ok((idle_hint, idle_hint_time))
 }
 
-async fn login_manager() -> zbus::Result<ManagerProxy<'static>> {
+pub async fn login_manager() -> zbus::Result<ManagerProxy<'static>> {
     let conn = zbus::Connection::system().await?;
     let manager = ManagerProxy::new(&conn).await?;
     Ok(manager)

@@ -1,6 +1,6 @@
+use anyhow::{Context, Result};
 use bluer::{AdapterEvent, DeviceEvent, DeviceProperty, DiscoveryFilter, DiscoveryTransport};
 use clap::{Parser, Subcommand};
-use commands::run;
 use config::get_config;
 use futures::{pin_mut, stream::SelectAll, StreamExt};
 use std::{
@@ -32,7 +32,7 @@ enum Commands {
     Setup,
 }
 
-async fn check_bluetooth_permissions() -> anyhow::Result<()> {
+async fn check_bluetooth_permissions() -> Result<()> {
     match bluer::Session::new().await {
         Ok(_) => Ok(()),
         Err(e) => {
@@ -49,7 +49,7 @@ async fn check_bluetooth_permissions() -> anyhow::Result<()> {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let cli = Cli::parse();
@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
+async fn run_daemon(config_path: Option<PathBuf>) -> Result<()> {
     log::info!("Starting daemon...");
     let config = Arc::new(get_config(config_path.as_deref())?);
     if config.is_empty() {
@@ -76,20 +76,21 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let login_manager = idle::login_manager().await?;
+
     let session = bluer::Session::new().await?;
     let adapter = session.default_adapter().await?;
     adapter.set_powered(true).await?;
 
     let filter = DiscoveryFilter {
         transport: DiscoveryTransport::Le,
-        duplicate_data: true,
         ..Default::default()
     };
     adapter.set_discovery_filter(filter).await?;
-    let device_events = adapter.discover_devices().await?;
+    let device_events = adapter.discover_devices_with_changes().await?;
     pin_mut!(device_events);
 
-    let mut all_change_events = SelectAll::new();
+    let mut prop_change_events = SelectAll::new();
 
     let cfg = config.clone();
     spawn(async move {
@@ -99,12 +100,18 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             let can_unlock = cfg.can_unlock();
             if can_unlock {
                 log::info!("Unlocking...");
-                run("loginctl unlock-sessions").unwrap();
+                if let Err(e) = login_manager.unlock_sessions().await {
+                    log::error!("Failed to unlock sessions: {}", e);
+                }
                 continue;
             }
 
             let should_lock = cfg.should_lock();
-            if !should_lock {
+            if should_lock {
+                log::info!("Locking...");
+                if let Err(e) = login_manager.lock_sessions().await {
+                    log::error!("Failed to lock sessions: {}", e);
+                }
                 continue;
             }
 
@@ -113,13 +120,18 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                 continue;
             }
 
-            let (idle, idle_since) = idle::get_idle_hint().await.unwrap();
-            let idle_since = UNIX_EPOCH + Duration::from_micros(idle_since);
-            let idle_for = SystemTime::now().duration_since(idle_since).unwrap();
+            if let Ok((idle, idle_since)) = idle::get_idle_hint().await {
+                let idle_since = UNIX_EPOCH + Duration::from_micros(idle_since);
+                let idle_for = SystemTime::now()
+                    .duration_since(idle_since)
+                    .unwrap_or(Duration::from_secs(0));
 
-            if idle && idle_for > Duration::from_secs(10) {
-                log::info!("Idle for: {:?}", idle_for);
-                run("loginctl lock-sessions").unwrap();
+                if idle && idle_for > Duration::from_secs(10) {
+                    log::info!("Idle for: {:?}", idle_for);
+                    if let Err(e) = login_manager.lock_sessions().await {
+                        log::error!("Failed to lock sessions: {}", e);
+                    }
+                }
             }
         }
     });
@@ -129,39 +141,42 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             Some(device_event) = device_events.next() => {
                 match device_event {
                     AdapterEvent::DeviceAdded(addr) => {
-                        log::debug!("{} Added", addr);
-
                         if !config.contains(&addr.to_string()) {
+                            log::debug!("Device Added: {:?}", addr);
                             continue;
                         }
-                        let device = adapter.device(addr)?;
-                        let rssi = device.rssi().await?.unwrap_or_default();
+
+                        let device = adapter.device(addr).context("Failed to get device")?;
+                        let rssi = device.rssi().await.context("Failed to get RSSI")?;
+                        let name = device.name().await.context("Failed to get device name")?;
+                        log::info!("Device Added: {:?}({:?}), {:?} dBm", addr, name, rssi);
 
                         config.update_rssi(&addr.to_string(), rssi);
-                        log::info!("{:?} {:.2}m",addr,distance_rssi(rssi));
 
+                        // watch for device changes
                         let change_events = device.events().await?.map(move |evt| (addr, evt));
-                        all_change_events.push(change_events);
+                        prop_change_events.push(change_events);
                     }
                     AdapterEvent::DeviceRemoved(addr) => {
-                        log::debug!("{} Removed", addr);
-
                         if !config.contains(&addr.to_string()) {
+                            log::debug!("Device Removed: {:?}", addr);
                             continue;
                         }
-
-                        config.update_rssi(&addr.to_string(), -99);
+                        log::info!("Device Removed: {:?}", addr);
+                        config.update_rssi(&addr.to_string(), None);
                     }
                     _ => (),
                 }
             }
-            Some((addr, DeviceEvent::PropertyChanged(property))) = all_change_events.next() => {
+            Some((addr, DeviceEvent::PropertyChanged(property))) = prop_change_events.next() => {
                 match property {
                     DeviceProperty::Rssi(rssi) => {
-                        config.update_rssi(&addr.to_string(), rssi);
-                        log::info!("{:?} {:.2}m", addr, distance_rssi(rssi));
+                        config.update_rssi(&addr.to_string(), Some(rssi));
+                        log::info!("RSSI changed: {} {}dBm (~{:.2}m)", addr, rssi, distance_rssi(rssi));
                     },
-                    _ => {}
+                    _ => {
+                        log::debug!("Property changed: {} {:?}", addr, property);
+                    }
                 }
             }
         }
@@ -169,7 +184,8 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 pub fn distance_rssi(rssi: i16) -> f32 {
-    // 10 ^ ((-69 – (-60))/(10 * 2))
-    let exponent = (-69 - rssi) as f32 / (10_i16.pow(2)) as f32;
+    // 10 ^ ((Measured Power - RSSI) / (10 * N))
+    // Measured Power is -69 (at 1m), N is 2 (environmental factor)
+    let exponent = (-69 - rssi) as f32 / 20.0;
     10_f32.powf(exponent)
 }

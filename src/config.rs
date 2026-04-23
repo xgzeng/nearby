@@ -1,4 +1,4 @@
-use crate::{commands::Command, distance_rssi};
+use crate::commands::Command;
 use figment::{
     providers::{Env, Format, Toml},
     Figment,
@@ -65,20 +65,22 @@ impl Config {
     }
 
     pub fn contains(&self, mac: &str) -> bool {
-        self.inner.lock().unwrap().connection.iter().any(|c| {
-            c.get_ble()
-                .map(|ble| ble.mac == mac)
-                .unwrap_or(false)
-        })
+        self.inner
+            .lock()
+            .unwrap()
+            .connection
+            .iter()
+            .any(|c| c.get_ble().map(|ble| ble.mac == mac).unwrap_or(false))
     }
 
-    pub fn update_rssi(&self, mac: &str, rssi: i16) {
+    pub fn update_rssi(&self, mac: &str, rssi: Option<i16>) {
         let mut inner = self.inner.lock().unwrap();
         for connection in inner.connection.iter_mut() {
             match connection {
                 Connection::Ble(ble) => {
                     if ble.mac == mac {
-                        ble.rssi = Some(rssi);
+                        log::debug!("Updating RSSI for {}: {:?} -> {:?}", mac, ble.rssi, rssi);
+                        ble.rssi = rssi;
                     }
                 }
             }
@@ -138,13 +140,15 @@ pub struct BLEConnection {
 
 impl BLEConnection {
     pub fn can_unlock(&self) -> bool {
-        let distance = self.rssi.map(distance_rssi).unwrap_or(1000.0);
+        let Some(rssi) = self.rssi else {
+            return false;
+        };
         self.actions
             .as_ref()
             .map(|actions| {
                 actions.iter().any(|a| match a {
                     Action::Nearby(action) => {
-                        distance < action.threshold && action.command == Command::Unlock
+                        rssi > action.threshold && action.command == Command::Unlock
                     }
                     Action::Away(_) => false,
                 })
@@ -153,13 +157,15 @@ impl BLEConnection {
     }
 
     pub fn keep_unlocked(&self) -> bool {
-        let distance = self.rssi.map(distance_rssi).unwrap_or(1000.0);
+        let Some(rssi) = self.rssi else {
+            return false;
+        };
         self.actions
             .as_ref()
             .map(|actions| {
                 actions.iter().any(|a| match a {
                     Action::Nearby(action) => {
-                        distance < action.threshold && action.command == Command::KeepUnlocked
+                        rssi > action.threshold && action.command == Command::KeepUnlocked
                     }
                     Action::Away(_) => false,
                 })
@@ -168,14 +174,16 @@ impl BLEConnection {
     }
 
     pub fn should_lock(&self) -> bool {
-        let distance = self.rssi.map(distance_rssi).unwrap_or(1000.0);
+        let Some(rssi) = self.rssi else {
+            return true;
+        };
         self.actions
             .as_ref()
             .map(|actions| {
                 actions.iter().any(|a| match a {
                     Action::Nearby(_) => false,
                     Action::Away(action) => {
-                        distance > action.threshold && action.command == Command::Lock
+                        rssi < action.threshold && action.command == Command::Lock
                     }
                 })
             })
@@ -194,13 +202,19 @@ pub enum Action {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProximityAction {
     #[serde(default)]
-    pub threshold: f32,
+    pub threshold: i16,
     pub command: Command,
 }
 
 const APP_NAME: &str = "nearby";
 
 pub fn default_config_dir() -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        if unsafe { libc::getuid() } == 0 {
+            return std::path::PathBuf::from("/etc").join(APP_NAME);
+        }
+    }
     let config_dir = dirs::config_dir().expect("Could not find config directory");
     config_dir.join(APP_NAME)
 }
@@ -230,17 +244,16 @@ mod tests {
     fn test_save_config_permissions_and_content() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let config_path = dir.path().join("nearby").join("config.toml");
-        
+
         let data = ConfigData {
             connection: vec![Connection::Ble(BLEConnection {
                 mac: "AA:BB:CC:DD:EE:FF".to_string(),
                 name: Some("Test Device".to_string()),
                 rssi: None,
-                actions: Some(vec![
-                    Action::Nearby(ProximityAction {
-                        threshold: 2.0,
-                        command: Command::Unlock,
-                    })]),
+                actions: Some(vec![Action::Nearby(ProximityAction {
+                    threshold: -60,
+                    command: Command::Unlock,
+                })]),
             })],
         };
 

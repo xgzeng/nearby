@@ -1,10 +1,10 @@
 use anyhow::Result;
 use crate::config::{save_config, backup_config, default_config_dir, ConfigData, Connection, BLEConnection, Action, ProximityAction};
 use crate::commands::Command;
-use crate::distance_rssi;
 use std::fs;
 use std::path::PathBuf;
 use std::io::{self};
+use std::time::Duration;
 
 use crossterm::{
     event::{self, Event, KeyCode},
@@ -124,8 +124,8 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<()> {
             name: dev.name.clone(),
             rssi: None,
             actions: Some(vec![
-                Action::Nearby(ProximityAction { threshold: distance_rssi(n_rssi), command: Command::Unlock }),
-                Action::Away(ProximityAction { threshold: distance_rssi(a_rssi), command: Command::Lock }),
+                Action::Nearby(ProximityAction { threshold: n_rssi, command: Command::Unlock }),
+                Action::Away(ProximityAction { threshold: a_rssi, command: Command::Lock }),
             ]),
         }));
     }
@@ -138,5 +138,3 @@ pub async fn run_wizard(config_path: Option<PathBuf>) -> Result<()> {
     
     Ok(())
 }
-
-use std::time::Duration;

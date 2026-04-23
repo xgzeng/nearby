@@ -1,14 +1,17 @@
 use anyhow::Result;
 use bluer::{Adapter, AdapterEvent, DiscoveryFilter, DiscoveryTransport};
+use futures::stream::SelectAll;
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::sleep;
 
-use crossterm::event::{self, Event, KeyCode};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::execute;
 use crossterm::cursor::{Hide, Show};
+use crossterm::event::{self, Event, KeyCode};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use std::io::{self};
 use std::path::Path;
 
@@ -27,7 +30,7 @@ use crate::config::ConfigData;
 pub struct DiscoveredDevice {
     pub name: Option<String>,
     pub addr: String,
-    pub rssi: i16,
+    pub rssi: Option<i16>,
 }
 
 #[derive(PartialEq)]
@@ -37,25 +40,25 @@ enum FilterField {
     Rssi,
 }
 
-/// Helper to convert distance (meters) back to RSSI (dBm).
-fn rssi_at_distance(dist: f32) -> i16 {
-    // rssi = -69 - 20 * log10(dist)
-    (-69.0 - 20.0 * dist.log10()).round() as i16
-}
-
 /// Unified UI showing device list as a table with multi-device calibration and removal.
-pub async fn setup_devices(adapter: &Adapter, initial_config: &ConfigData, config_path: &Path) -> Result<Vec<(DiscoveredDevice, i16, i16)>> {
+pub async fn setup_devices(
+    adapter: &Adapter,
+    initial_config: &ConfigData,
+    config_path: &Path,
+) -> Result<Vec<(DiscoveredDevice, i16, i16)>> {
     let filter = DiscoveryFilter {
         transport: DiscoveryTransport::Le,
         duplicate_data: true,
         ..Default::default()
     };
     adapter.set_discovery_filter(filter.clone()).await?;
-    
-    let mut device_events = adapter.discover_devices().await?;
+
+    let mut device_events = adapter.discover_devices_with_changes().await?;
     let mut devices_map: HashMap<String, DiscoveredDevice> = HashMap::new();
     let mut table_state = TableState::default();
     table_state.select(Some(0));
+
+    let mut all_change_events = SelectAll::new();
 
     // Filter state
     let mut show_only_named = false;
@@ -69,19 +72,22 @@ pub async fn setup_devices(adapter: &Adapter, initial_config: &ConfigData, confi
     // Load initial config into devices and thresholds
     for conn in &initial_config.connection {
         if let Some(ble) = conn.get_ble() {
-            devices_map.insert(ble.mac.clone(), DiscoveredDevice {
-                name: ble.name.clone(),
-                addr: ble.mac.clone(),
-                rssi: -100, // Placeholder for offline
-            });
+            devices_map.insert(
+                ble.mac.clone(),
+                DiscoveredDevice {
+                    name: ble.name.clone(),
+                    addr: ble.mac.clone(),
+                    rssi: None, // Placeholder for offline
+                },
+            );
 
             if let Some(actions) = &ble.actions {
                 let mut n = None;
                 let mut a = None;
                 for action in actions {
                     match action {
-                        crate::config::Action::Nearby(p) => n = Some(rssi_at_distance(p.threshold)),
-                        crate::config::Action::Away(p) => a = Some(rssi_at_distance(p.threshold)),
+                        crate::config::Action::Nearby(p) => n = Some(p.threshold),
+                        crate::config::Action::Away(p) => a = Some(p.threshold),
                     }
                 }
                 thresholds.insert(ble.mac.clone(), (n, a));
@@ -97,11 +103,26 @@ pub async fn setup_devices(adapter: &Adapter, initial_config: &ConfigData, confi
 
     let result = 'main: loop {
         // 1. Filter and Sort
-        let mut devices_list: Vec<DiscoveredDevice> = devices_map.values()
+        let mut devices_list: Vec<DiscoveredDevice> = devices_map
+            .values()
             .filter(|d| {
-                if show_only_named && d.name.is_none() { return false; }
-                if !mac_filter.is_empty() && !d.addr.to_lowercase().contains(&mac_filter.to_lowercase()) { return false; }
-                if let Some(t) = rssi_filter { if d.rssi < t { return false; } }
+                if show_only_named && d.name.is_none() {
+                    return false;
+                }
+                if !mac_filter.is_empty()
+                    && !d.addr.to_lowercase().contains(&mac_filter.to_lowercase())
+                {
+                    return false;
+                }
+                if let Some(t) = rssi_filter {
+                    if let Some(rssi) = d.rssi {
+                        if rssi < t {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
                 true
             })
             .cloned()
@@ -134,47 +155,104 @@ pub async fn setup_devices(adapter: &Adapter, initial_config: &ConfigData, confi
             // Title
             let title_text = format!(" Nearby BLE Setup (Config: {}) ", config_path.display());
             f.render_widget(
-                Paragraph::new(title_text.bold().cyan())
-                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))),
-                main_chunks[0]
+                Paragraph::new(title_text.bold().cyan()).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan)),
+                ),
+                main_chunks[0],
             );
 
             // Filters
-            let named_color = if show_only_named { Color::Green } else { Color::DarkGray };
-            let mac_color = if active_field == FilterField::Mac { Color::Yellow } else { Color::Gray };
-            let rssi_color = if active_field == FilterField::Rssi { Color::Yellow } else { Color::Gray };
+            let named_color = if show_only_named {
+                Color::Green
+            } else {
+                Color::DarkGray
+            };
+            let mac_color = if active_field == FilterField::Mac {
+                Color::Yellow
+            } else {
+                Color::Gray
+            };
+            let rssi_color = if active_field == FilterField::Rssi {
+                Color::Yellow
+            } else {
+                Color::Gray
+            };
 
-            let rssi_val_str = rssi_filter.map(|v| v.to_string()).unwrap_or_else(|| "None".to_string());
+            let rssi_val_str = rssi_filter
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "None".to_string());
             let filter_line = Line::from(vec![
                 Span::raw(" [f] Named Only: "),
-                Span::styled(if show_only_named { "ON " } else { "OFF" }, Style::default().fg(named_color)),
+                Span::styled(
+                    if show_only_named { "ON " } else { "OFF" },
+                    Style::default().fg(named_color),
+                ),
                 Span::raw(" | [m] MAC: "),
-                Span::styled(if active_field == FilterField::Mac { format!("{}█", mac_filter) } else { mac_filter.clone() }, Style::default().fg(mac_color)),
+                Span::styled(
+                    if active_field == FilterField::Mac {
+                        format!("{}█", mac_filter)
+                    } else {
+                        mac_filter.clone()
+                    },
+                    Style::default().fg(mac_color),
+                ),
                 Span::raw(" | [r] RSSI Min: "),
-                Span::styled(if active_field == FilterField::Rssi { format!("{}█", rssi_val_str) } else { rssi_val_str }, Style::default().fg(rssi_color)),
+                Span::styled(
+                    if active_field == FilterField::Rssi {
+                        format!("{}█", rssi_val_str)
+                    } else {
+                        rssi_val_str
+                    },
+                    Style::default().fg(rssi_color),
+                ),
                 Span::raw(" | [c] Clear Filters"),
             ]);
             f.render_widget(
-                Paragraph::new(filter_line).block(Block::default().borders(Borders::ALL).title(" Filters ")),
-                main_chunks[1]
+                Paragraph::new(filter_line)
+                    .block(Block::default().borders(Borders::ALL).title(" Filters ")),
+                main_chunks[1],
             );
 
             // Table
             let header_cells = ["RSSI", "Name", "MAC Address", "Nearby", "Away"]
                 .iter()
-                .map(|h| Cell::from(*h).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+                .map(|h| {
+                    Cell::from(*h).style(
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                });
             let header = Row::new(header_cells).height(1).bottom_margin(1);
 
             let rows = devices_list.iter().enumerate().map(|(_, d)| {
-                let rssi_display = if d.rssi <= -100 { "OFFLINE".to_string() } else { format!("{} dBm", d.rssi) };
-                let rssi_style = if d.rssi > -60 { Color::Green } else if d.rssi > -80 { Color::Yellow } else { Color::Red };
+                let rssi_display = if let Some(rssi) = d.rssi {
+                    format!("{} dBm", rssi)
+                } else {
+                    "OFFLINE".to_string()
+                };
+                let rssi_style = if let Some(rssi) = d.rssi {
+                    if rssi > -60 {
+                        Color::Green
+                    } else if rssi > -80 {
+                        Color::Yellow
+                    } else {
+                        Color::Red
+                    }
+                } else {
+                    Color::DarkGray
+                };
                 let (n_set, a_set) = thresholds.get(&d.addr).cloned().unwrap_or((None, None));
-                
+
                 let is_configured = n_set.is_some() && a_set.is_some();
-                let name_style = if is_configured { 
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD) 
-                } else { 
-                    Style::default() 
+                let name_style = if is_configured {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
                 };
 
                 let name_display = d.name.as_deref().unwrap_or("<Unknown>");
@@ -183,8 +261,18 @@ pub async fn setup_devices(adapter: &Adapter, initial_config: &ConfigData, confi
                     Cell::from(rssi_display).style(Style::default().fg(rssi_style)),
                     Cell::from(name_display).style(name_style),
                     Cell::from(d.addr.clone()).style(Style::default().fg(Color::DarkGray)),
-                    Cell::from(n_set.map(|v| format!("{} dBm", v)).unwrap_or_else(|| "--".into())).style(Style::default().fg(Color::Green)),
-                    Cell::from(a_set.map(|v| format!("{} dBm", v)).unwrap_or_else(|| "--".into())).style(Style::default().fg(Color::Red)),
+                    Cell::from(
+                        n_set
+                            .map(|v| format!("{} dBm", v))
+                            .unwrap_or_else(|| "--".into()),
+                    )
+                    .style(Style::default().fg(Color::Green)),
+                    Cell::from(
+                        a_set
+                            .map(|v| format!("{} dBm", v))
+                            .unwrap_or_else(|| "--".into()),
+                    )
+                    .style(Style::default().fg(Color::Red)),
                 ])
             });
 
@@ -199,27 +287,55 @@ pub async fn setup_devices(adapter: &Adapter, initial_config: &ConfigData, confi
                 ],
             )
             .header(header)
-            .block(Block::default().borders(Borders::ALL).title(" Discovered & Configured Devices "))
-            .row_highlight_style(Style::default().bg(Color::Indexed(236)).add_modifier(Modifier::BOLD))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Discovered & Configured Devices "),
+            )
+            .row_highlight_style(
+                Style::default()
+                    .bg(Color::Indexed(236))
+                    .add_modifier(Modifier::BOLD),
+            )
             .highlight_symbol(">");
 
             f.render_stateful_widget(table, main_chunks[2], &mut table_state);
 
             // Help
             let help_text = vec![
-                Line::from("↑/↓: Navigate | f/m/r: Filters | c: Clear Filters | Space: Toggle Config"),
+                Line::from(
+                    "↑/↓: Navigate | f/m/r: Filters | c: Clear Filters | Space: Toggle Config",
+                ),
                 Line::from(vec![
-                    Span::styled("n", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "n",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw(": Set Nearby | "),
-                    Span::styled("a", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "a",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw(": Set Away | "),
-                    Span::styled("Enter", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "Enter",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw(": Save All & Finish"),
                 ]),
             ];
             f.render_widget(
-                Paragraph::new(help_text).block(Block::default().borders(Borders::ALL).title(" Help ").border_style(Style::default().fg(Color::DarkGray))),
-                main_chunks[3]
+                Paragraph::new(help_text).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Help ")
+                        .border_style(Style::default().fg(Color::DarkGray)),
+                ),
+                main_chunks[3],
             );
         })?;
 
@@ -267,17 +383,17 @@ pub async fn setup_devices(adapter: &Adapter, initial_config: &ConfigData, confi
                             KeyCode::Char('c') => { show_only_named = false; mac_filter.clear(); rssi_filter = None; }
                             KeyCode::Char('n') => {
                                 if let Some(d) = highlighted_device {
-                                    if d.rssi > -100 { // Only set if online
+                                    if let Some(rssi) = d.rssi { // Only set if online
                                         let entry = thresholds.entry(d.addr.clone()).or_insert((None, None));
-                                        entry.0 = Some(d.rssi);
+                                        entry.0 = Some(rssi);
                                     }
                                 }
                             }
                             KeyCode::Char('a') => {
                                 if let Some(d) = highlighted_device {
-                                    if d.rssi > -100 { // Only set if online
+                                    if let Some(rssi) = d.rssi { // Only set if online
                                         let entry = thresholds.entry(d.addr.clone()).or_insert((None, None));
-                                        entry.1 = Some(d.rssi);
+                                        entry.1 = Some(rssi);
                                     }
                                 }
                             }
@@ -285,8 +401,8 @@ pub async fn setup_devices(adapter: &Adapter, initial_config: &ConfigData, confi
                                 if let Some(d) = highlighted_device {
                                     if thresholds.contains_key(&d.addr) {
                                         thresholds.remove(&d.addr);
-                                    } else if d.rssi > -100 {
-                                        thresholds.insert(d.addr.clone(), (Some(d.rssi + 3), Some(d.rssi - 3)));
+                                    } else if let Some(rssi) = d.rssi {
+                                        thresholds.insert(d.addr.clone(), (Some(rssi - 3), Some(rssi - 6)));
                                     }
                                 }
                             }
@@ -319,11 +435,41 @@ pub async fn setup_devices(adapter: &Adapter, initial_config: &ConfigData, confi
                     AdapterEvent::DeviceAdded(addr) => {
                         let device = adapter.device(addr)?;
                         let name = device.name().await?;
-                        let rssi = device.rssi().await?.unwrap_or(-99);
-                        devices_map.insert(addr.to_string(), DiscoveredDevice { name, addr: addr.to_string(), rssi });
+                        let rssi = device.rssi().await?;
+                        devices_map.insert(addr.to_string(), DiscoveredDevice { name: name.clone(), addr: addr.to_string(), rssi });
+
+                        // Watch for property changes
+                        if let Ok(events) = device.events().await {
+                            all_change_events.push(events.map(move |e| (addr, e)));
+                        }
+                    }
+                    AdapterEvent::DeviceRemoved(addr) => {
+                        let addr_str = addr.to_string();
+                        if thresholds.contains_key(&addr_str) {
+                            if let Some(device) = devices_map.get_mut(&addr_str) {
+                                device.rssi = None;
+                            }
+                        } else {
+                            devices_map.remove(&addr_str);
+                        }
                     }
                     AdapterEvent::PropertyChanged(bluer::AdapterProperty::Discovering(false)) => {
                         adapter.set_discovery_filter(filter.clone()).await?;
+                    }
+                    _ => {}
+                }
+            }
+            Some((addr, bluer::DeviceEvent::PropertyChanged(property))) = all_change_events.next() => {
+                match property {
+                    bluer::DeviceProperty::Name(name) => {
+                        if let Some(device) = devices_map.get_mut(&addr.to_string()) {
+                            device.name = Some(name);
+                        }
+                    }
+                    bluer::DeviceProperty::Rssi(rssi) => {
+                        if let Some(device) = devices_map.get_mut(&addr.to_string()) {
+                            device.rssi = Some(rssi);
+                        }
                     }
                     _ => {}
                 }
